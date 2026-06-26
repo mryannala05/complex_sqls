@@ -1,0 +1,80 @@
+
+  table_catalog AS project,
+  table_schema  AS dataset,
+  table_name    AS view_name,
+  CONCAT(table_catalog, '.', table_schema, '.', table_name) AS full_name,
+  REGEXP_REPLACE(table_catalog, r'([.\-\\])', r'\\\1') AS proj_re,
+  REGEXP_REPLACE(table_schema,  r'([.\-\\])', r'\\\1') AS ds_re,
+  REGEXP_REPLACE(table_name,    r'([.\-\\])', r'\\\1') AS name_re,
+  REGEXP_REPLACE(REGEXP_REPLACE(view_definition, r'`', ''), r'\s*\.\s*', '.') AS def_norm
+FROM `project1`.`region-us`.INFORMATION_SCHEMA.VIEWS;   -- <<< set PROJECT and REGION
+
+-- 2) Your list of tables. Edit the array (put all 100 here).
+--    Each gets its own bounded regex (qualified OR partial form).
+CREATE TEMP TABLE targets AS
+SELECT
+  full_name,
+  CONCAT(
+    r'(?:^|[^A-Za-z0-9_.\-])(?:',
+      REGEXP_REPLACE(SPLIT(full_name, '.')[OFFSET(0)], r'([.\-\\])', r'\\\1'), r'\.)?',
+    REGEXP_REPLACE(SPLIT(full_name, '.')[OFFSET(1)], r'([.\-\\])', r'\\\1'), r'\.',
+    REGEXP_REPLACE(SPLIT(full_name, '.')[OFFSET(2)], r'([.\-\\])', r'\\\1'),
+    r'(?:$|[^A-Za-z0-9_])'
+  ) AS target_re
+FROM UNNEST([
+  'project1.dataset1.table1',
+  'project1.dataset1.table2',
+  'project1.dataset2.table9'
+  -- ... up to 100, one per line
+]) AS full_name;
+
+-- ── Alternatives for step 2 (swap the SELECT...FROM UNNEST source) ──
+--   From your own metadata table:
+--     FROM `project1.meta.tables_to_check`            (column named full_name)
+--   Every base table in a dataset:
+--     SELECT CONCAT(table_catalog,'.',table_schema,'.',table_name) AS full_name
+--     FROM `project1.dataset1`.INFORMATION_SCHEMA.TABLES
+--     WHERE table_type = 'BASE TABLE'
+
+-- 3) Walk the reverse-dependency graph, carrying each chain's root table.
+WITH RECURSIVE deps AS (
+
+  -- Hop 1: views referencing one of the target tables directly.
+  SELECT
+    v.project, v.dataset, v.view_name, v.full_name,
+    v.proj_re, v.ds_re, v.name_re,
+    t.full_name AS root_table,
+    1 AS hops,
+    CONCAT(v.full_name, ' -> ', t.full_name) AS path
+  FROM all_views v
+  JOIN targets t
+    ON REGEXP_CONTAINS(v.def_norm, t.target_re)
+
+  UNION ALL
+
+  -- Hop n+1: views referencing a view already discovered (inherits its root table).
+  SELECT
+    v.project, v.dataset, v.view_name, v.full_name,
+    v.proj_re, v.ds_re, v.name_re,
+    d.root_table,
+    d.hops + 1,
+    CONCAT(v.full_name, ' -> ', d.path)
+  FROM all_views v
+  JOIN deps d
+    ON v.full_name != d.full_name
+   AND d.hops < 50
+   AND REGEXP_CONTAINS(
+         v.def_norm,
+         CONCAT(r'(?:^|[^A-Za-z0-9_.\-])(?:', d.proj_re, r'\.)?',
+                d.ds_re, r'\.', d.name_re, r'(?:$|[^A-Za-z0-9_])'))
+)
+
+SELECT
+  root_table,
+  project, dataset, view_name,
+  MIN(hops)       AS min_hops,     -- 1 = direct, 2 = via one intermediate view, ...
+  COUNT(*)        AS paths_found,
+  ANY_VALUE(path) AS example_path
+FROM deps
+GROUP BY root_table, project, dataset, view_name
+ORDER BY root_table, min_hops, project, dataset, view_name;
