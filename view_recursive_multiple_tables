@@ -1,54 +1,93 @@
 -- ============================================================
--- For a LIST of tables, find every view that references each one
--- DIRECTLY or TRANSITIVELY (view1 -> view2 -> ... -> table).
--- Single pass over INFORMATION_SCHEMA, regardless of list size.
--- Output is one row per (table, view) with the shortest hop count.
+-- Recursive view-dependency search -- FINAL (verified against RE2).
+-- Configured for: mixed qualified/partial references, logical views only.
+--
+--   * Many target tables, multiple projects, project-aware matching
+--   * Comments stripped (-- , # , /* multi-line */) before matching
+--   * Cross-line / odd-spacing references normalized
+--   * Identifiers matched CASE-SENSITIVELY (BigQuery semantics);
+--     only the FROM/JOIN keyword gate is case-insensitive
+--   * Partial (dataset.name) references supported, but gated by a
+--     table-introducing context to avoid alias.column collisions
 -- ============================================================
 
--- 1) Snapshot all views once (set PROJECT + REGION in the FROM).
+-- Keep FALSE: your codebase mixes qualified and partial references,
+-- so partials must be followed (TRUE would drop them entirely).
+DECLARE STRICT_QUALIFIED_ONLY BOOL DEFAULT FALSE;
+
+-- Whether a comma may introduce a partial table reference (old-style `FROM a, b`).
+--   TRUE  = catch partial tables in comma-joins (favors recall; safest for
+--           "what breaks if I change this table"). Rare side effect: a
+--           `SELECT x, alias.col` can false-match if alias==a dataset name
+--           and col==a table name in your list.
+--   FALSE = if your joins are explicit (JOIN ... ON), set this to remove that
+--           false positive entirely. FROM/JOIN partials are unaffected.
+DECLARE ALLOW_COMMA_PARTIAL BOOL DEFAULT TRUE;
+
+-- Context that may precede a *partial* (no-project) reference.
+-- (?i:from|join) => keyword case-insensitive; identifiers stay case-sensitive.
+DECLARE PARTIAL_PREFIX STRING DEFAULT CONCAT(
+  r'(?:(?:^|[^A-Za-z0-9_])(?i:from|join)\s+',
+  IF(ALLOW_COMMA_PARTIAL, r'|,\s*', ''),
+  r')'
+);
+
+-- 1) Snapshot logical views from ALL relevant projects (cleaning computed once).
 CREATE TEMP TABLE all_views AS
+WITH raw AS (
+  SELECT table_catalog, table_schema, table_name, view_definition
+  FROM `gcp_project1`.`region-us`.INFORMATION_SCHEMA.VIEWS        -- <<< project / region
+  UNION ALL
+  SELECT table_catalog, table_schema, table_name, view_definition
+  FROM `gcp_project2`.`region-us`.INFORMATION_SCHEMA.VIEWS        -- <<< add more as needed
+)
 SELECT
   table_catalog AS project,
   table_schema  AS dataset,
   table_name    AS view_name,
-  CONCAT(table_catalog, '.', table_schema, '.', table_name) AS full_name,
-  REGEXP_REPLACE(table_catalog, r'([.\-\\])', r'\\\1') AS proj_re,
+  CONCAT(table_catalog,'.',table_schema,'.',table_name) AS full_name,
+  REGEXP_REPLACE(table_catalog, r'([.\-\\])', r'\\\1') AS proj_re,   -- case preserved
   REGEXP_REPLACE(table_schema,  r'([.\-\\])', r'\\\1') AS ds_re,
   REGEXP_REPLACE(table_name,    r'([.\-\\])', r'\\\1') AS name_re,
-  REGEXP_REPLACE(REGEXP_REPLACE(view_definition, r'`', ''), r'\s*\.\s*', '.') AS def_norm
-FROM `project1`.`region-us`.INFORMATION_SCHEMA.VIEWS;   -- <<< set PROJECT and REGION
+  REGEXP_REPLACE(                                              -- e) collapse whitespace runs
+    REGEXP_REPLACE(                                            -- d) whitespace around dots -> "."
+      REPLACE(                                                 -- c) drop backticks
+        REGEXP_REPLACE(                                        -- b) line comments (-- and #)
+          REGEXP_REPLACE(COALESCE(view_definition,''),         -- a) block comments /* ... */
+                         r'/\*[\s\S]*?\*/', ' '),
+          r'(?:--|#)[^\n]*', ' '),
+        '`', ''),
+      r'\s*\.\s*', '.'),
+    r'\s+', ' ') AS def_norm
+FROM raw;
 
--- 2) Your list of tables. Edit the array (put all 100 here).
---    Each gets its own bounded regex (qualified OR partial form).
+-- 2) Target tables (one per line). Each must be exactly project.dataset.table.
 CREATE TEMP TABLE targets AS
 SELECT
   full_name,
+  SPLIT(full_name, '.')[OFFSET(0)] AS proj,
   CONCAT(
-    r'(?:^|[^A-Za-z0-9_.\-])(?:',
-      REGEXP_REPLACE(SPLIT(full_name, '.')[OFFSET(0)], r'([.\-\\])', r'\\\1'), r'\.)?',
-    REGEXP_REPLACE(SPLIT(full_name, '.')[OFFSET(1)], r'([.\-\\])', r'\\\1'), r'\.',
-    REGEXP_REPLACE(SPLIT(full_name, '.')[OFFSET(2)], r'([.\-\\])', r'\\\1'),
+    r'(?:^|[^A-Za-z0-9_.\-])',
+    REGEXP_REPLACE(SPLIT(full_name,'.')[OFFSET(0)], r'([.\-\\])', r'\\\1'), r'\.',
+    REGEXP_REPLACE(SPLIT(full_name,'.')[OFFSET(1)], r'([.\-\\])', r'\\\1'), r'\.',
+    REGEXP_REPLACE(SPLIT(full_name,'.')[OFFSET(2)], r'([.\-\\])', r'\\\1'),
     r'(?:$|[^A-Za-z0-9_])'
-  ) AS target_re
+  ) AS full_re,
+  CONCAT(
+    PARTIAL_PREFIX,
+    REGEXP_REPLACE(SPLIT(full_name,'.')[OFFSET(1)], r'([.\-\\])', r'\\\1'), r'\.',
+    REGEXP_REPLACE(SPLIT(full_name,'.')[OFFSET(2)], r'([.\-\\])', r'\\\1'),
+    r'(?:$|[^A-Za-z0-9_])'
+  ) AS partial_re
 FROM UNNEST([
-  'project1.dataset1.table1',
-  'project1.dataset1.table2',
-  'project1.dataset2.table9'
+  'gcp_project1.dataset_id_tbls.table1'
+  -- , 'gcp_project1.dataset1.table2'
   -- ... up to 100, one per line
 ]) AS full_name;
 
--- ── Alternatives for step 2 (swap the SELECT...FROM UNNEST source) ──
---   From your own metadata table:
---     FROM `project1.meta.tables_to_check`            (column named full_name)
---   Every base table in a dataset:
---     SELECT CONCAT(table_catalog,'.',table_schema,'.',table_name) AS full_name
---     FROM `project1.dataset1`.INFORMATION_SCHEMA.TABLES
---     WHERE table_type = 'BASE TABLE'
-
--- 3) Walk the reverse-dependency graph, carrying each chain's root table.
+-- 3) Walk the reverse-dependency graph (project-aware at every level).
 WITH RECURSIVE deps AS (
 
-  -- Hop 1: views referencing one of the target tables directly.
   SELECT
     v.project, v.dataset, v.view_name, v.full_name,
     v.proj_re, v.ds_re, v.name_re,
@@ -57,11 +96,13 @@ WITH RECURSIVE deps AS (
     CONCAT(v.full_name, ' -> ', t.full_name) AS path
   FROM all_views v
   JOIN targets t
-    ON REGEXP_CONTAINS(v.def_norm, t.target_re)
+    ON REGEXP_CONTAINS(v.def_norm, t.full_re)
+    OR (NOT STRICT_QUALIFIED_ONLY
+        AND v.project = t.proj
+        AND REGEXP_CONTAINS(v.def_norm, t.partial_re))
 
   UNION ALL
 
-  -- Hop n+1: views referencing a view already discovered (inherits its root table).
   SELECT
     v.project, v.dataset, v.view_name, v.full_name,
     v.proj_re, v.ds_re, v.name_re,
@@ -72,18 +113,27 @@ WITH RECURSIVE deps AS (
   JOIN deps d
     ON v.full_name != d.full_name
    AND d.hops < 50
-   AND REGEXP_CONTAINS(
-         v.def_norm,
-         CONCAT(r'(?:^|[^A-Za-z0-9_.\-])(?:', d.proj_re, r'\.)?',
-                d.ds_re, r'\.', d.name_re, r'(?:$|[^A-Za-z0-9_])'))
+   AND (
+        REGEXP_CONTAINS(
+          v.def_norm,
+          CONCAT(r'(?:^|[^A-Za-z0-9_.\-])', d.proj_re, r'\.', d.ds_re, r'\.', d.name_re,
+                 r'(?:$|[^A-Za-z0-9_])'))
+        OR (NOT STRICT_QUALIFIED_ONLY
+            AND v.project = d.project
+            AND REGEXP_CONTAINS(
+                  v.def_norm,
+                  CONCAT(PARTIAL_PREFIX, d.ds_re, r'\.', d.name_re,
+                         r'(?:$|[^A-Za-z0-9_])')))
+       )
 )
 
 SELECT
   root_table,
   project, dataset, view_name,
-  MIN(hops)       AS min_hops,     -- 1 = direct, 2 = via one intermediate view, ...
-  COUNT(*)        AS paths_found,
-  ANY_VALUE(path) AS example_path
+  MIN(hops)        AS min_hops,
+  MAX(hops)        AS max_hops,
+  COUNT(*)         AS paths_found,
+  ARRAY_AGG(path)  AS all_paths
 FROM deps
 GROUP BY root_table, project, dataset, view_name
 ORDER BY root_table, min_hops, project, dataset, view_name;
